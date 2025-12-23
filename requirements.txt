@@ -1,0 +1,6 @@
+discord.py>=2.3.2
+tweepy>=4.14.0
+openai>=1.40.0
+python-dotenv
+schedule
+requests
