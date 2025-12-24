@@ -184,7 +184,7 @@ async def report(interaction: discord.Interaction):
     await interaction.response.send_message("📊 報告已生成（示範）")
 
 # 啟動 Bot
-client.run("你的DISCORD_TOKEN")
+client.run(DISCORD_BOT_TOKEN)
 
 
 # -------------- 啟動 --------------
