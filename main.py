@@ -22,26 +22,21 @@ TWITTER_ACCESS_SECRET = os.getenv("TWITTER_ACCESS_SECRET")
 openai.api_key = OPENAI_API_KEY
 
 # -------------- Discord Bot --------------
+import discord
 from discord import app_commands
+
+intents = discord.Intents.default()
+intents.message_content = True  
 
 class MyBot(discord.Client):
     def __init__(self):
-        super().__init__(intents=intents)
+        super().__init__(intents=intents)  
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        await self.tree.sync()  # 註冊指令到伺服器
+        await self.tree.sync()  
 
 client = MyBot()
-
-@client.tree.command(name="addtime", description="新增發文時段")
-@app_commands.describe(time_str="時段，例如 14:00")
-async def addtime(interaction: discord.Interaction, time_str: str):
-    global post_times
-    post_times.append(time_str)
-    await interaction.response.send_message(f"✅ 新增發文時段: {time_str}")
-
-client.run(DISCORD_TOKEN)
 
 
 # -------------- Twitter Client --------------
@@ -119,11 +114,15 @@ async def scheduler():
         print(f"⏳ 現在時間 {now}，未到發文時段")
 
 # -------------- Discord 指令 --------------
-@bot.command()
-async def addtime(ctx, time_str):
+from discord import app_commands
+
+@client.tree.command(name="addtime", description="新增發文時段")
+@app_commands.describe(time_str="時段，例如 14:00")
+async def addtime(interaction: discord.Interaction, time_str: str):
     global post_times
     post_times.append(time_str)
-    await ctx.send(f"✅ 新增發文時段: {time_str}")
+    await interaction.response.send_message(f"✅ 新增發文時段: {time_str}")
+
 
 @bot.command()
 async def removetime(ctx, time_str):
