@@ -4,3 +4,5 @@ openai>=1.40.0
 python-dotenv
 schedule
 requests
+pytz
+aiohttp
