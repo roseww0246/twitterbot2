@@ -100,43 +100,57 @@ async def scheduler():
         print(f"⏳ 現在時間 {now}，未到發文時段")
 
 # -------------- Discord 指令 --------------
-@bot.command()
-async def addtime(ctx, time_str):
-    post_times.append(time_str)
-    await ctx.send(f"✅ 新增發文時段: {time_str}")
+@tree.command(name="addtime", description="新增發文時段")
+async def addtime(interaction: discord.Interaction, time: str):
+    cur.execute("INSERT OR IGNORE INTO timeslots VALUES (?)", (time,))
+    db.commit()
+    setup_schedule()
+    await interaction.response.send_message(f"✅ 已新增 {time}")
 
-@bot.command()
-async def removetime(ctx, time_str):
-    if time_str in post_times:
-        post_times.remove(time_str)
-        await ctx.send(f"✅ 刪除發文時段: {time_str}")
-    else:
-        await ctx.send("⚠️ 時段不存在")
+@tree.command(name="removetime", description="刪除發文時段")
+async def removetime(interaction: discord.Interaction, time: str):
+    cur.execute("DELETE FROM timeslots WHERE time=?", (time,))
+    cur.execute("DELETE FROM themes WHERE time=?", (time,))
+    db.commit()
+    setup_schedule()
+    await interaction.response.send_message(f"🗑️ 已刪除 {time}")
 
-@bot.command()
-async def time_schedule(ctx):
-    await ctx.send(f"📅 現有發文時段: {post_times}")
+@tree.command(name="time_schedule", description="查看發文時段")
+async def time_schedule(interaction: discord.Interaction):
+    await interaction.response.send_message("\n".join(load_times()))
 
-@bot.command()
-async def addtheme(ctx, *, theme):
-    themes.append(theme)
-    await ctx.send(f"✅ 新增主題: {theme}")
+@tree.command(name="addtheme", description="新增主題")
+async def addtheme(interaction: discord.Interaction, time: str, theme: str):
+    cur.execute("INSERT OR IGNORE INTO themes VALUES (?, ?, 1, 1)", (time, theme))
+    db.commit()
+    await interaction.response.send_message("✅ 主題已新增")
 
-@bot.command()
-async def removetheme(ctx, *, theme):
-    if theme in themes:
-        themes.remove(theme)
-        await ctx.send(f"✅ 刪除主題: {theme}")
-    else:
-        await ctx.send("⚠️ 主題不存在")
+@tree.command(name="removetheme", description="刪除主題")
+async def removetheme(interaction: discord.Interaction, time: str, theme: str):
+    cur.execute("DELETE FROM themes WHERE time=? AND theme=?", (time, theme))
+    db.commit()
+    await interaction.response.send_message("🗑️ 主題已刪除")
 
-@bot.command()
-async def theme_schedule(ctx):
-    await ctx.send(f"📌 現有主題: {themes}")
+@tree.command(name="theme_schedule", description="查看主題成效")
+async def theme_schedule(interaction: discord.Interaction):
+    await interaction.response.send_message(build_report())
 
-@bot.command()
-async def report(ctx):
-    await generate_and_post()
+@tree.command(name="stop", description="停止系統")
+async def stop(interaction: discord.Interaction):
+    global RUNNING
+    RUNNING = False
+    await interaction.response.send_message("🛑 已停止")
+
+@tree.command(name="resume", description="恢復系統")
+async def resume(interaction: discord.Interaction):
+    global RUNNING, ERROR_COUNT
+    RUNNING = True
+    ERROR_COUNT = 0
+    await interaction.response.send_message("▶️ 已恢復")
+
+@tree.command(name="report", description="即時成效報告")
+async def report(interaction: discord.Interaction):
+    await interaction.response.send_message(build_report())
 
 # -------------- 啟動 --------------
 @bot.event
