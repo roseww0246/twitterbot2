@@ -2,202 +2,205 @@ import os
 import asyncio
 import logging
 from datetime import datetime
-import pytz
-
-import aiohttp
-import discord
-from discord import app_commands
+import random
 
 from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse
-from contextlib import asynccontextmanager
-
 import uvicorn
+
+import discord
+from discord.ext import commands
+
 import tweepy
 from openai import OpenAI
 
-# ======================
+# =========================
 # 基本設定
-# ======================
+# =========================
+
 logging.basicConfig(level=logging.INFO)
 
+TZ = "Asia/Taipei"
+
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+if not DISCORD_TOKEN:
+    raise RuntimeError("❌ DISCORD_TOKEN 未設定")
 
-X_API_KEY = os.getenv("X_API_KEY")
-X_API_SECRET = os.getenv("X_API_SECRET")
-X_ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN")
-X_ACCESS_SECRET = os.getenv("X_ACCESS_SECRET")
+# =========================
+# OpenAI
+# =========================
 
-PORT = int(os.getenv("PORT", 8080))
-TZ = pytz.timezone(os.getenv("TIMEZONE", "Asia/Taipei"))
+openai_client = None
+if os.getenv("OPENAI_API_KEY"):
+    openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    logging.info("✅ OpenAI 已啟用")
+else:
+    logging.warning("⚠️ 未設定 OPENAI_API_KEY，跳過 AI 生成")
 
-POST_TIMES = ["08:00", "12:00", "18:00", "22:00"]
-THEMES = ["可愛動物", "迷因", "療癒"]
+# =========================
+# X (Twitter)
+# =========================
 
-paused = False
+x_client = None
+try:
+    if all(os.getenv(k) for k in [
+        "X_API_KEY", "X_API_SECRET",
+        "X_ACCESS_TOKEN", "X_ACCESS_SECRET"
+    ]):
+        auth = tweepy.OAuth1UserHandler(
+            os.getenv("X_API_KEY"),
+            os.getenv("X_API_SECRET"),
+            os.getenv("X_ACCESS_TOKEN"),
+            os.getenv("X_ACCESS_SECRET"),
+        )
+        x_client = tweepy.API(auth)
+        x_client.verify_credentials()
+        logging.info("✅ X API 登入成功")
+    else:
+        logging.warning("⚠️ X API 未完整設定")
+except Exception as e:
+    logging.error(f"❌ X API 初始化失敗: {e}")
+    x_client = None
 
-# ======================
-# Discord
-# ======================
+# =========================
+# Discord Bot
+# =========================
+
 intents = discord.Intents.default()
-bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
 
 @bot.event
 async def on_ready():
-    await tree.sync()
     logging.info(f"✅ Discord 已登入：{bot.user}")
+    try:
+        await bot.tree.sync()
+        logging.info("✅ Discord 指令已同步")
+    except Exception as e:
+        logging.error(f"❌ 指令同步失敗: {e}")
 
-# ======================
-# Slash Commands
-# ======================
-@tree.command(name="debug", description="系統狀態")
+
+@bot.tree.command(name="debug", description="系統狀態檢測")
 async def debug(interaction: discord.Interaction):
     await interaction.response.send_message(
-        f"""🧪 系統狀態
-⏰ {datetime.now(TZ)}
-⏸ 暫停：{paused}
-📅 時段：{", ".join(POST_TIMES)}
-🎨 主題數：{len(THEMES)}"""
+        f"""
+🧪 系統狀態
+━━━━━━━━━━━━━━
+🕒 時間：{datetime.now()}
+🤖 Discord：✅
+🐦 X API：{"✅" if x_client else "❌"}
+🎨 OpenAI：{"✅" if openai_client else "❌"}
+""",
+        ephemeral=True
     )
 
-@tree.command(name="stop", description="暫停自動發文")
-async def stop(interaction: discord.Interaction):
-    global paused
-    paused = True
-    await interaction.response.send_message("⏸ 已暫停")
+# =========================
+# AI 生成內容
+# =========================
 
-@tree.command(name="resume", description="恢復自動發文")
-async def resume(interaction: discord.Interaction):
-    global paused
-    paused = False
-    await interaction.response.send_message("▶️ 已恢復")
+async def generate_ai_post():
+    if not openai_client:
+        return "自動推文測試 🚀", None
 
-# ======================
-# OpenAI 圖片生成
-# ======================
-openai_client = OpenAI(api_key=OPENAI_KEY)
+    prompt = random.choice([
+        "生成一則科技感十足的推文",
+        "生成一則療癒風格的短推文",
+        "生成一則未來感 AI 主題推文"
+    ])
 
-async def generate_image(theme):
-    prompt = f"可愛風格插畫，主題是：{theme}"
+    text = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    ).choices[0].message.content.strip()
+
+    image_url = None
     try:
-        result = openai_client.images.generate(
+        img = openai_client.images.generate(
             model="gpt-image-1",
-            prompt=prompt,
+            prompt="未來感 AI 插畫，科技風，乾淨背景",
             size="1024x1024"
         )
-        return result.data[0].url
+        image_url = img.data[0].url
     except Exception as e:
-        logging.error(f"❌ OpenAI 生成失敗: {e}")
-        return None
+        logging.warning(f"圖片生成失敗（Free tier 可忽略）: {e}")
 
-# ======================
-# X API
-# ======================
-def get_x_client():
-    try:
-        auth = tweepy.OAuth1UserHandler(
-            X_API_KEY, X_API_SECRET,
-            X_ACCESS_TOKEN, X_ACCESS_SECRET
-        )
-        return tweepy.API(auth)
-    except Exception as e:
-        logging.error(f"❌ X API 初始化失敗: {e}")
-        return None
+    return text, image_url
 
-# ======================
-# 發文流程
-# ======================
+# =========================
+# 發推
+# =========================
+
 async def post_to_x():
-    if paused:
+    if not x_client:
+        logging.warning("⚠️ 未啟用 X，自動跳過發文")
         return
 
-    now = datetime.now(TZ).strftime("%H:%M")
-    if now not in POST_TIMES:
-        return
-
-    theme = THEMES[now.__hash__() % len(THEMES)]
-    img_url = await generate_image(theme)
-
-    api = get_x_client()
-    if not api:
-        return
-
-    text = f"{theme} 🐾"
+    text, image_url = await generate_ai_post()
 
     try:
-        # Free tier 偵測
-        if img_url:
-            api.update_status(status=text + "\n" + img_url)
+        if image_url:
+            x_client.update_status(status=text + "\n" + image_url)
         else:
-            api.update_status(status=text)
+            x_client.update_status(status=text)
 
-        logging.info("✅ 推文成功")
-
-        # Discord 回報
-        for guild in bot.guilds:
-            for channel in guild.text_channels:
-                if channel.permissions_for(guild.me).send_messages:
-                    await channel.send(f"🐦 已發推文：{text}")
-                    return
-
+        logging.info("🐦 已自動發推")
     except Exception as e:
-        logging.error(f"❌ 發文失敗: {e}")
+        logging.error(f"❌ 發推失敗: {e}")
 
-# ======================
-# 排程 Loop
-# ======================
-async def scheduler():
+# =========================
+# 排程（完全自動）
+# =========================
+
+async def scheduler_loop():
+    schedule_hours = [8, 12, 18, 22]
+
     while True:
-        try:
+        now = datetime.now()
+        if now.hour in schedule_hours and now.minute == 0:
+            logging.info("⏰ 觸發排程發文")
             await post_to_x()
-        except Exception as e:
-            logging.error(f"Scheduler error: {e}")
-        await asyncio.sleep(60)
+            await asyncio.sleep(60)
 
-# ======================
-# Railway 自我保活
-# ======================
-async def self_ping():
-    await asyncio.sleep(10)
-    url = f"http://127.0.0.1:{PORT}/ping"
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                async with session.get(url):
-                    logging.info("💓 保活")
-            except:
-                pass
-            await asyncio.sleep(25)
+        await asyncio.sleep(20)
 
-# ======================
-# FastAPI Lifespan
-# ======================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logging.info("🚀 啟動服務")
+# =========================
+# 心跳（Railway 保活）
+# =========================
 
-    tasks = [
-        asyncio.create_task(bot.start(DISCORD_TOKEN)),
-        asyncio.create_task(self_ping()),
-        asyncio.create_task(scheduler())
-    ]
+async def heartbeat():
+    while True:
+        logging.info(f"🫀 Bot 活動中... {datetime.now()}")
+        await asyncio.sleep(30)
 
-    yield
+# =========================
+# FastAPI（主服務）
+# =========================
 
-    for t in tasks:
-        t.cancel()
-    await bot.close()
+app = FastAPI()
 
-app = FastAPI(lifespan=lifespan)
 
 @app.get("/ping")
 async def ping():
-    return PlainTextResponse("pong")
+    logging.info("保活心跳: 200")
+    return {"status": "ok"}
 
-# ======================
-# Main
-# ======================
+
+@app.on_event("startup")
+async def startup():
+    logging.info("🚀 FastAPI 啟動，啟動背景服務")
+    asyncio.create_task(bot.start(DISCORD_TOKEN))
+    asyncio.create_task(heartbeat())
+    asyncio.create_task(scheduler_loop())
+
+# =========================
+# 啟動點（唯一主行程）
+# =========================
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8080)),
+        log_level="info",
+    )
+
