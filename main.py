@@ -1,97 +1,80 @@
 import os
 import discord
-from discord import app_commands
 from discord.ext import commands
 import openai
-import io
+import aiohttp
 import asyncio
 import logging
 
-# -------------------------
-# 基本設定
-# -------------------------
+# ---------- 設定日誌 ----------
 logging.basicConfig(level=logging.INFO)
+
+# ---------- 環境變數 ----------
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "1234567890"))  # 改成你的頻道ID
+
+if not DISCORD_TOKEN or not OPENAI_API_KEY:
+    raise Exception("請確認 DISCORD_TOKEN 和 OPENAI_API_KEY 已經設定")
+
+openai.api_key = OPENAI_API_KEY
+
+# ---------- Discord Bot 設定 ----------
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
+bot = commands.Bot(command_prefix="/", intents=intents)
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-
-if not DISCORD_TOKEN or not openai.api_key:
-    logging.error("請確認 DISCORD_TOKEN 和 OPENAI_API_KEY 已設定在環境變數中！")
-    raise SystemExit(1)
-
-# -------------------------
-# Bot 事件
-# -------------------------
+# ---------- Bot 事件 ----------
 @bot.event
 async def on_ready():
-    await tree.sync()
-    logging.info(f"✅ Discord 已登入：{bot.user}")
-    logging.info("🫀 Bot 正在待命...")
+    logging.info(f"✅ 已登入 Discord: {bot.user}")
+    logging.info("🫀 Bot 待命中...")
 
-# -------------------------
-# /make picture 指令
-# -------------------------
-@tree.command(name="make_picture", description="生成圖片並回傳到 Discord")
-@app_commands.describe(prompt="請輸入圖片描述")
-async def make_picture(interaction: discord.Interaction, prompt: str):
-    await interaction.response.defer()
-    logging.info(f"🖼️ 收到生成圖片請求: {prompt}")
+# ---------- /make picture 指令 ----------
+@bot.slash_command(name="make picture", description="生成圖片並回傳到頻道")
+async def make_picture(ctx, *, prompt: str):
+    """使用 OpenAI 生成圖片並回傳 Discord"""
+    await ctx.respond(f"🎨 收到請求，生成圖片中: `{prompt}`", ephemeral=True)
+    
     try:
-        response = openai.Image.create(
+        response = await openai.images.generate(
+            model="gpt-image-1",  # 最新圖片生成模型
             prompt=prompt,
-            n=1,
             size="1024x1024"
         )
-        image_url = response['data'][0]['url']
-        
-        # 下載圖片並回傳
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(image_url) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send("❌ 無法下載圖片")
-                    return
-                data = io.BytesIO(await resp.read())
-                file = discord.File(fp=data, filename="image.png")
-                await interaction.followup.send(file=file)
-        logging.info("✅ 圖片已回傳")
-    except Exception as e:
-        logging.error(f"❌ 生成圖片失敗: {e}")
-        await interaction.followup.send(f"❌ 生成圖片失敗: {e}")
 
-# -------------------------
-# /debug 指令
-# -------------------------
-@tree.command(name="debug", description="檢查 Bot 與 OpenAI API 狀態")
-async def debug(interaction: discord.Interaction):
-    status = f"🫀 Bot 已登入：{bot.user}\n"
-    # 測試 OpenAI 連線
-    try:
-        openai.Engine.list()
-        status += "✅ OpenAI API 正常"
+        image_url = response.data[0].url
+        channel = bot.get_channel(CHANNEL_ID)
+        if channel:
+            await channel.send(f"🖼️ 生成完成: `{prompt}`\n{image_url}")
+        else:
+            await ctx.followup.send("⚠️ 找不到指定頻道，請檢查 CHANNEL_ID")
     except Exception as e:
-        status += f"❌ OpenAI API 錯誤: {e}"
-    await interaction.response.send_message(status)
+        logging.error(f"生成圖片失敗: {e}")
+        await ctx.followup.send(f"❌ 生成圖片失敗: {e}")
 
-# -------------------------
-# 永遠運行保護
-# -------------------------
+# ---------- 保活 (適用 Railway) ----------
 async def keep_alive():
-    while True:
-        await asyncio.sleep(60)
-        logging.info("💓 Bot 保活中...")
+    from fastapi import FastAPI
+    import uvicorn
 
-# -------------------------
-# 主程序
-# -------------------------
+    app = FastAPI()
+
+    @app.get("/ping")
+    async def ping():
+        return {"status": "ok"}
+
+    config = uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)), log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+# ---------- 主程式 ----------
 async def main():
-    async with bot:
-        bot.loop.create_task(keep_alive())
-        await bot.start(DISCORD_TOKEN)
+    await asyncio.gather(
+        bot.start(DISCORD_TOKEN),
+        keep_alive()
+    )
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
