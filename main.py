@@ -1,201 +1,197 @@
 import os
 import asyncio
+import random
+import logging
 from datetime import datetime, timedelta
 import pytz
-import requests
+
 import discord
-from discord.ext import commands, tasks
-import tweepy
-import openai
+from discord import app_commands
 from dotenv import load_dotenv
 
-# -------------- 環境變數 --------------
+import tweepy
+from openai import OpenAI
+
+# ======================
+# 基本設定
+# ======================
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+logging.basicConfig(level=logging.INFO)
+
+TZ = pytz.timezone("Asia/Taipei")
+
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
-TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
-TWITTER_API_SECRET = os.getenv("TWITTER_API_SECRET")
-TWITTER_ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN")
-TWITTER_ACCESS_SECRET = os.getenv("TWITTER_ACCESS_SECRET")
 
-openai.api_key = OPENAI_API_KEY
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# -------------- Discord Bot --------------
-import discord
-from discord import app_commands
+# ======================
+# 安全檢查
+# ======================
+if not all([DISCORD_TOKEN, DISCORD_CHANNEL_ID, OPENAI_API_KEY]):
+    raise RuntimeError("❌ 環境變數未設定完整")
 
-intents = discord.Intents.default()
-intents.message_content = True  
+# ======================
+# OpenAI Client (API)
+# ======================
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-class MyBot(discord.Client):
-    def __init__(self):
-        super().__init__(intents=intents)  
-        self.tree = app_commands.CommandTree(self)
-
-    async def setup_hook(self):
-        await self.tree.sync()  
-
-client = MyBot()
-
-
-# -------------- Twitter Client --------------
-auth = tweepy.OAuth1UserHandler(
-    TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET
+# ======================
+# Twitter Client (API)
+# ======================
+twitter_client = tweepy.Client(
+    consumer_key=os.getenv("TWITTER_API_KEY"),
+    consumer_secret=os.getenv("TWITTER_API_SECRET"),
+    access_token=os.getenv("TWITTER_ACCESS_TOKEN"),
+    access_token_secret=os.getenv("TWITTER_ACCESS_SECRET")
 )
-twitter_client = tweepy.API(auth)
 
-# -------------- 設定時區與排程 --------------
-tz = pytz.timezone("Asia/Taipei")
-# 初始時段
+# ======================
+# 狀態資料（之後可換 SQLite）
+# ======================
 post_times = ["08:00", "12:00", "18:00", "22:00"]
-# 初始主題
-themes = ["cute animals", "meme"]
+themes = ["可愛動物", "迷因"]
+paused = False
+last_post_time = {}
 
-# -------------- 偵錯模式函數 --------------
-async def generate_and_post():
-    now = datetime.now(tz)
-    print(f"⏰ 排程觸發時間: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-    if not themes:
-        print("⚠️ 主題列表為空，跳過發圖")
-        return
-    theme_prompt = themes[now.hour % len(themes)]
-    print("📌 主題列表:", themes)
-    print(f"📍 選擇主題: {theme_prompt}")
-
-    # 生成圖片
-    try:
-        print("📍 呼叫 OpenAI 生成圖片...")
-        response = openai.Image.create(prompt=theme_prompt, n=1, size="1024x1024")
-        image_url = response['data'][0]['url']
-        print("✅ OpenAI 圖片 URL:", image_url)
-    except Exception as e:
-        print("❌ OpenAI 生成失敗:", e)
-        return
-
-    # 下載圖片
-    try:
-        print("📍 下載圖片到本地...")
-        filename = "temp.png"
-        r = requests.get(image_url)
-        with open(filename, "wb") as f:
-            f.write(r.content)
-        print("✅ 圖片下載完成")
-    except Exception as e:
-        print("❌ 圖片下載失敗:", e)
-        return
-
-    # 發文到 Twitter
-    try:
-        print("📍 發推文...")
-        media = twitter_client.media_upload(filename)
-        twitter_client.update_status(status=theme_prompt, media_ids=[media.media_id])
-        print("✅ 推文發送成功")
-    except Exception as e:
-        print("❌ 發推文失敗:", e)
-        return
-
-    # 回報到 Discord
-    try:
-        channel = bot.get_channel(DISCORD_CHANNEL_ID)
-        await channel.send(f"✅ {now.strftime('%Y-%m-%d %H:%M')} 推文完成\n主題: {theme_prompt}\nOpenAI URL: {image_url}")
-        print("✅ 成效回報已送到 Discord")
-    except Exception as e:
-        print("❌ Discord 回報失敗:", e)
-
-# -------------- 排程任務 --------------
-@tasks.loop(minutes=1)
-async def scheduler():
-    now = datetime.now(tz).strftime("%H:%M")
-    if now in post_times:
-        print(f"🚀 時間匹配 {now}，開始發文流程")
-        await generate_and_post()
-    else:
-        print(f"⏳ 現在時間 {now}，未到發文時段")
-
-# -------------- Discord 指令 --------------
-from discord import app_commands
-import discord
-
+# ======================
+# Discord Bot
+# ======================
 intents = discord.Intents.default()
-intents.message_content = True
 
-# 全域列表
-post_times = ["08:00", "12:00", "18:00", "22:00"]
-themes = ["cute animals", "meme"]
-
-class MyBot(discord.Client):
+class Bot(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
         await self.tree.sync()
+        self.bg_task = asyncio.create_task(post_scheduler())
+        logging.info("✅ Slash commands synced")
 
-client = MyBot()
+bot = Bot()
 
-# ---------- Slash Commands ----------
+# ======================
+# 工具函數
+# ======================
+def now_str():
+    return datetime.now(TZ).strftime("%H:%M")
 
-@client.tree.command(name="addtime", description="新增發文時段")
-@app_commands.describe(time_str="時段，例如 14:00")
-async def addtime(interaction: discord.Interaction, time_str: str):
-    global post_times
-    post_times.append(time_str)
-    await interaction.response.send_message(f"✅ 新增發文時段: {time_str}")
+async def send_dc(msg: str):
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if channel:
+        await channel.send(msg)
 
-@client.tree.command(name="removetime", description="刪除發文時段")
-@app_commands.describe(time_str="時段，例如 14:00")
-async def removetime(interaction: discord.Interaction, time_str: str):
-    global post_times
-    if time_str in post_times:
-        post_times.remove(time_str)
-        await interaction.response.send_message(f"✅ 刪除發文時段: {time_str}")
+# ======================
+# OpenAI 圖片生成（API）
+# ======================
+async def generate_image(theme: str) -> str:
+    logging.info(f"🎨 生成圖片主題：{theme}")
+    result = openai_client.images.generate(
+        model="gpt-image-1",
+        prompt=f"{theme}，高品質，適合社群媒體",
+        size="1024x1024"
+    )
+    image_url = result.data[0].url
+    return image_url
+
+# ======================
+# 發推文（API）
+# ======================
+async def post_to_twitter(image_url: str, text: str):
+    twitter_client.create_tweet(
+        text=text + "\n" + image_url
+    )
+
+# ======================
+# 排程核心（非阻塞）
+# ======================
+async def post_scheduler():
+    await bot.wait_until_ready()
+    logging.info("🕒 排程啟動")
+
+    while not bot.is_closed():
+        try:
+            if paused:
+                await asyncio.sleep(30)
+                continue
+
+            now = now_str()
+
+            if now in post_times:
+                last = last_post_time.get(now)
+                if not last or datetime.now(TZ) - last > timedelta(minutes=59):
+                    theme = random.choice(themes)
+                    image_url = await generate_image(theme)
+                    await post_to_twitter(image_url, f"{theme} 時間到！")
+                    last_post_time[now] = datetime.now(TZ)
+                    await send_dc(f"✅ 已發文：{now}｜主題：{theme}")
+
+            await asyncio.sleep(30)
+
+        except Exception as e:
+            logging.exception("❌ 排程錯誤")
+            await send_dc(f"❌ 排程錯誤：{e}")
+            await asyncio.sleep(60)
+
+# ======================
+# Slash Commands
+# ======================
+@bot.tree.command(name="addtime", description="新增發文時段（HH:MM）")
+async def addtime(interaction: discord.Interaction, time: str):
+    post_times.append(time)
+    await interaction.response.send_message(f"✅ 已新增時段 {time}")
+
+@bot.tree.command(name="removetime", description="刪除發文時段")
+async def removetime(interaction: discord.Interaction, time: str):
+    if time in post_times:
+        post_times.remove(time)
+        await interaction.response.send_message(f"🗑️ 已刪除 {time}")
     else:
-        await interaction.response.send_message(f"⚠️ 時段不存在: {time_str}")
+        await interaction.response.send_message("⚠️ 找不到該時段")
 
-@client.tree.command(name="time_schedule", description="查看現有發文時段")
+@bot.tree.command(name="time_schedule", description="查看所有發文時段")
 async def time_schedule(interaction: discord.Interaction):
-    await interaction.response.send_message(f"📅 現有發文時段: {post_times}")
+    await interaction.response.send_message(f"🕒 發文時段：{post_times}")
 
-@client.tree.command(name="addtheme", description="新增發文主題")
-@app_commands.describe(theme="主題文字，例如 cute animals")
+@bot.tree.command(name="addtheme", description="新增主題")
 async def addtheme(interaction: discord.Interaction, theme: str):
-    global themes
     themes.append(theme)
-    await interaction.response.send_message(f"✅ 新增主題: {theme}")
+    await interaction.response.send_message(f"🎨 新增主題：{theme}")
 
-@client.tree.command(name="removetheme", description="刪除發文主題")
-@app_commands.describe(theme="主題文字，例如 cute animals")
+@bot.tree.command(name="removetheme", description="刪除主題")
 async def removetheme(interaction: discord.Interaction, theme: str):
-    global themes
     if theme in themes:
         themes.remove(theme)
-        await interaction.response.send_message(f"✅ 刪除主題: {theme}")
+        await interaction.response.send_message(f"🗑️ 已刪除主題 {theme}")
     else:
-        await interaction.response.send_message(f"⚠️ 主題不存在: {theme}")
+        await interaction.response.send_message("⚠️ 找不到主題")
 
-@client.tree.command(name="theme_schedule", description="查看現有主題")
+@bot.tree.command(name="theme_schedule", description="查看主題列表")
 async def theme_schedule(interaction: discord.Interaction):
-    await interaction.response.send_message(f"📌 現有主題: {themes}")
+    await interaction.response.send_message(f"📌 主題：{themes}")
 
-@client.tree.command(name="report", description="立即生成報告")
+@bot.tree.command(name="stop", description="暫停自動發文")
+async def stop(interaction: discord.Interaction):
+    global paused
+    paused = True
+    await interaction.response.send_message("⏸️ 已暫停")
+
+@bot.tree.command(name="resume", description="恢復自動發文")
+async def resume(interaction: discord.Interaction):
+    global paused
+    paused = False
+    await interaction.response.send_message("▶️ 已恢復")
+
+@bot.tree.command(name="report", description="立即回傳狀態")
 async def report(interaction: discord.Interaction):
-    # 這裡可以呼叫你的 generate_and_post() 函數
-    await interaction.response.send_message("📊 報告已生成（示範）")
+    await interaction.response.send_message(
+        f"📊 狀態\n時段：{post_times}\n主題：{themes}\n暫停：{paused}"
+    )
 
-# 啟動 Bot
-client.run(DISCORD_BOT_TOKEN)
-
-
-# -------------- 啟動 --------------
-@bot.event
-async def on_ready():
-    print(f"🤖 Bot 已上線: {bot.user}")
-    scheduler.start()
-
-# -------------- 主程式 --------------
+# ======================
+# 啟動（唯一正確）
+# ======================
 if __name__ == "__main__":
-    try:
-        bot.run(DISCORD_BOT_TOKEN)
-    except KeyboardInterrupt:
-        print("🛑 手動停止 Bot")
+    logging.info("🚀 Bot starting")
+    bot.run(DISCORD_TOKEN)
