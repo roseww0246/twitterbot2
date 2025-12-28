@@ -9,14 +9,16 @@ import openai
 from fastapi import FastAPI
 import uvicorn
 import pytz
+import requests
+from io import BytesIO
 
 logging.basicConfig(level=logging.INFO)
 
 # ---------- 環境變數 ----------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-X_API_KEY = os.getenv("X_API_KEY")  # Twitter API Key
-X_API_SECRET = os.getenv("X_API_SECRET")  # Twitter API Secret
+X_API_KEY = os.getenv("X_API_KEY")
+X_API_SECRET = os.getenv("X_API_SECRET")
 X_ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN")
 X_ACCESS_SECRET = os.getenv("X_ACCESS_SECRET")
 
@@ -28,9 +30,7 @@ openai.api_key = OPENAI_API_KEY
 # ---------- Twitter 初始化 ----------
 twitter_client = None
 if all([X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET]):
-    auth = tweepy.OAuth1UserHandler(
-        X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET
-    )
+    auth = tweepy.OAuth1UserHandler(X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET)
     twitter_client = tweepy.API(auth)
     try:
         twitter_client.verify_credentials()
@@ -43,20 +43,19 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
-# ---------- 時段與主題管理 ----------
-time_slots = []  # e.g., ["08:00", "12:00", "18:00", "22:00"]
-themes = []      # e.g., ["AI", "Nature", "Funny"]
-
+# ---------- 時段與主題 ----------
+time_slots = ["08:00", "12:00", "18:00", "22:00"]
+themes = ["AI", "Nature", "Funny"]
 paused = False
 
 # ---------- Discord 指令 ----------
 @bot.event
 async def on_ready():
     logging.info(f"✅ 已登入 Discord: {bot.user}")
-    if not scheduler.is_running():
-        scheduler.start()
+    if not scheduled_task.is_running():
+        scheduled_task.start()
 
-@bot.command(name="addtime", help="增加排程時間")
+@bot.command(name="addtime")
 async def add_time(ctx, time_str: str):
     if time_str not in time_slots:
         time_slots.append(time_str)
@@ -64,7 +63,7 @@ async def add_time(ctx, time_str: str):
     else:
         await ctx.send("⚠️ 時段已存在")
 
-@bot.command(name="removetime", help="刪除排程時間")
+@bot.command(name="removetime")
 async def remove_time(ctx, time_str: str):
     if time_str in time_slots:
         time_slots.remove(time_str)
@@ -72,14 +71,11 @@ async def remove_time(ctx, time_str: str):
     else:
         await ctx.send("⚠️ 時段不存在")
 
-@bot.command(name="time_schedule", help="查看現有時段")
+@bot.command(name="time_schedule")
 async def time_schedule(ctx):
-    if time_slots:
-        await ctx.send(f"🕒 現有時段: {', '.join(time_slots)}")
-    else:
-        await ctx.send("⚠️ 尚未設定時段")
+    await ctx.send(f"🕒 現有時段: {', '.join(time_slots)}")
 
-@bot.command(name="addtheme", help="增加主題")
+@bot.command(name="addtheme")
 async def add_theme(ctx, *, theme: str):
     if theme not in themes:
         themes.append(theme)
@@ -87,7 +83,7 @@ async def add_theme(ctx, *, theme: str):
     else:
         await ctx.send("⚠️ 主題已存在")
 
-@bot.command(name="removetheme", help="刪除主題")
+@bot.command(name="removetheme")
 async def remove_theme(ctx, *, theme: str):
     if theme in themes:
         themes.remove(theme)
@@ -95,20 +91,17 @@ async def remove_theme(ctx, *, theme: str):
     else:
         await ctx.send("⚠️ 主題不存在")
 
-@bot.command(name="theme_schedule", help="查看現有主題")
+@bot.command(name="theme_schedule")
 async def theme_schedule(ctx):
-    if themes:
-        await ctx.send(f"📚 現有主題: {', '.join(themes)}")
-    else:
-        await ctx.send("⚠️ 尚未設定主題")
+    await ctx.send(f"📚 現有主題: {', '.join(themes)}")
 
-@bot.command(name="debug", help="系統偵錯")
+@bot.command(name="debug")
 async def debug(ctx):
     status = f"""
 🧪 系統偵錯
 ━━━━━━━━━━━━━━
 🕒 時區：{TIMEZONE.zone}
-⏰ 排程時間：{', '.join(time_slots) if time_slots else '未設定'}
+⏰ 排程時間：{', '.join(time_slots)}
 📚 主題數：{len(themes)}
 ⏸️ 暫停：{paused}
 
@@ -117,13 +110,13 @@ async def debug(ctx):
 """
     await ctx.send(status)
 
-@bot.command(name="pause", help="暫停自動發文")
+@bot.command(name="pause")
 async def pause(ctx):
     global paused
     paused = True
     await ctx.send("⏸️ 已暫停自動發文")
 
-@bot.command(name="resume", help="恢復自動發文")
+@bot.command(name="resume")
 async def resume(ctx):
     global paused
     paused = False
@@ -132,11 +125,7 @@ async def resume(ctx):
 # ---------- 發文與生成圖片 ----------
 async def generate_image(prompt):
     try:
-        result = openai.Image.create(
-            prompt=prompt,
-            n=1,
-            size="1024x1024"
-        )
+        result = openai.Image.create(prompt=prompt, n=1, size="1024x1024")
         return result['data'][0]['url']
     except Exception as e:
         logging.error(f"❌ 生成圖片失敗: {e}")
@@ -148,9 +137,6 @@ async def post_to_twitter(prompt):
         return
     image_url = await generate_image(prompt)
     if image_url:
-        # 下載圖片再上傳
-        import requests
-        from io import BytesIO
         resp = requests.get(image_url)
         img_data = BytesIO(resp.content)
         try:
@@ -158,17 +144,9 @@ async def post_to_twitter(prompt):
             logging.info("✅ 成功發文至 X")
         except Exception as e:
             logging.error(f"❌ 發文失敗: {e}")
-    else:
-        logging.warning("⚠️ 沒有生成圖片，跳過發文")
 
 # ---------- 排程 ----------
-scheduler = tasks.Loop(seconds=60)
-@scheduler.before_loop
-async def before_loop():
-    await bot.wait_until_ready()
-    logging.info("🫀 Bot 活動中...")
-
-@scheduler.loop
+@tasks.loop(seconds=60)
 async def scheduled_task():
     global paused
     if paused or not time_slots or not themes:
@@ -189,7 +167,6 @@ async def ping():
 # ---------- 主程式 ----------
 async def main():
     bot_task = asyncio.create_task(bot.start(DISCORD_TOKEN))
-    # FastAPI server 保活
     server_task = asyncio.create_task(
         uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)), log_level="info")
     )
