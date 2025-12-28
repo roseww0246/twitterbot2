@@ -1,150 +1,177 @@
 import os
-import asyncio
 import logging
+import asyncio
+from datetime import datetime, timezone, timedelta
+import sqlite3
 from discord.ext import commands, tasks
 import discord
-import tweepy  # X API
-from datetime import datetime
-import pytz
+import openai
+import tweepy
 
-# ---------- 環境變數 ----------
+# ====== Environment Variables ======
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
 TWITTER_API_SECRET = os.getenv("TWITTER_API_SECRET")
 TWITTER_ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN")
 TWITTER_ACCESS_SECRET = os.getenv("TWITTER_ACCESS_SECRET")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# ---------- 設定日誌 ----------
-logging.basicConfig(level=logging.INFO)
+# ====== Logging ======
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ---------- Discord Bot 設定 ----------
+# ====== Database ======
+conn = sqlite3.connect("bot_data.db")
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS times (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hour TEXT
+)""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS themes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    theme TEXT
+)""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    tweet TEXT
+)""")
+conn.commit()
+
+# ====== Discord Bot Setup ======
 intents = discord.Intents.default()
-intents.message_content = True  # 必須開啟才能使用 slash command
+intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
-# ---------- 推特登入 ----------
-twitter_client = None
+# ====== OpenAI Setup ======
+openai.api_key = OPENAI_API_KEY
+
+# ====== Twitter Setup ======
 try:
     auth = tweepy.OAuth1UserHandler(
         TWITTER_API_KEY, TWITTER_API_SECRET,
         TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET
     )
     twitter_client = tweepy.API(auth)
-    logging.info("✅ X API 登入成功")
 except Exception as e:
-    logging.error(f"❌ X API 登入失敗: {e}")
+    logging.error(f"Twitter 初始化失敗: {e}")
+    twitter_client = None
 
-# ---------- 時間與主題 ----------
-time_slots = ["08:00", "12:00", "18:00", "22:00"]
-themes = ["AI", "Tech", "Gaming"]
-paused = False
-timezone = pytz.timezone("Asia/Taipei")
+# ====== Helper Functions ======
+async def generate_image(prompt: str) -> str:
+    try:
+        response = openai.Image.create(
+            prompt=prompt,
+            n=1,
+            size="1024x1024"
+        )
+        image_url = response['data'][0]['url']
+        return image_url
+    except Exception as e:
+        logging.error(f"生成圖片失敗: {e}")
+        return None
 
-# ---------- 排程任務 ----------
-@tasks.loop(minutes=1)
-async def scheduled_post():
-    global paused
-    if paused:
-        return
-    now = datetime.now(timezone).strftime("%H:%M")
-    if now in time_slots:
-        try:
-            message = f"今天主題: {themes}"
-            if twitter_client:
-                twitter_client.update_status(message)
-                logging.info(f"🐦 已發文: {message}")
-        except Exception as e:
-            logging.error(f"❌ 發文失敗: {e}")
+async def post_tweet(text: str, image_url: str = None):
+    if not twitter_client:
+        logging.warning("Twitter 未初始化")
+        return False
+    try:
+        if image_url:
+            filename = "temp.png"
+            # Download image
+            import requests
+            r = requests.get(image_url)
+            with open(filename, "wb") as f:
+                f.write(r.content)
+            twitter_client.update_status_with_media(status=text, filename=filename)
+        else:
+            twitter_client.update_status(status=text)
+        return True
+    except Exception as e:
+        logging.error(f"發推失敗: {e}")
+        return False
 
-# ---------- Discord 指令 ----------
+# ====== Discord Commands ======
 @bot.command()
-async def addtime(ctx, time: str):
-    """新增排程時間"""
-    if time not in time_slots:
-        time_slots.append(time)
-        await ctx.send(f"✅ 新增時段: {time}")
-    else:
-        await ctx.send("⚠️ 時段已存在")
+async def addtime(ctx, hour: str):
+    cursor.execute("INSERT INTO times (hour) VALUES (?)", (hour,))
+    conn.commit()
+    await ctx.send(f"✅ 已新增時段 {hour}")
 
 @bot.command()
-async def removetime(ctx, time: str):
-    """移除排程時間"""
-    if time in time_slots:
-        time_slots.remove(time)
-        await ctx.send(f"✅ 移除時段: {time}")
-    else:
-        await ctx.send("⚠️ 時段不存在")
+async def removetime(ctx, hour: str):
+    cursor.execute("DELETE FROM times WHERE hour=?", (hour,))
+    conn.commit()
+    await ctx.send(f"🗑️ 已刪除時段 {hour}")
 
 @bot.command()
 async def time_schedule(ctx):
-    """查看現有時段"""
-    await ctx.send(f"🕒 時段: {', '.join(time_slots)}")
+    cursor.execute("SELECT hour FROM times")
+    times = cursor.fetchall()
+    await ctx.send(f"🕒 現有時段: {', '.join(t[0] for t in times)}")
 
 @bot.command()
 async def addtheme(ctx, theme: str):
-    """新增主題"""
-    if theme not in themes:
-        themes.append(theme)
-        await ctx.send(f"✅ 新增主題: {theme}")
-    else:
-        await ctx.send("⚠️ 主題已存在")
+    cursor.execute("INSERT INTO themes (theme) VALUES (?)", (theme,))
+    conn.commit()
+    await ctx.send(f"✅ 已新增主題 {theme}")
 
 @bot.command()
 async def removetheme(ctx, theme: str):
-    """移除主題"""
-    if theme in themes:
-        themes.remove(theme)
-        await ctx.send(f"✅ 移除主題: {theme}")
-    else:
-        await ctx.send("⚠️ 主題不存在")
+    cursor.execute("DELETE FROM themes WHERE theme=?", (theme,))
+    conn.commit()
+    await ctx.send(f"🗑️ 已刪除主題 {theme}")
 
 @bot.command()
 async def theme_schedule(ctx):
-    """查看主題列表"""
-    await ctx.send(f"📚 主題: {', '.join(themes)}")
+    cursor.execute("SELECT theme FROM themes")
+    themes = cursor.fetchall()
+    await ctx.send(f"📚 現有主題: {', '.join(t[0] for t in themes)}")
+
+@bot.command()
+async def report(ctx):
+    cursor.execute("SELECT timestamp, tweet FROM reports ORDER BY id DESC LIMIT 5")
+    reports = cursor.fetchall()
+    msg = "\n".join([f"{t[0]}: {t[1]}" for t in reports])
+    await ctx.send(f"📊 最新報告:\n{msg}")
 
 @bot.command()
 async def debug(ctx):
-    """回報狀態"""
-    status = f"""
-🧪 系統偵錯
-━━━━━━━━━━━━━━
-🕒 時區：{timezone.zone}
-⏰ 排程時間：{', '.join(time_slots)}
-📚 主題數：{len(themes)}
-⏸️ 暫停：{paused}
+    await ctx.send(f"🧪 Bot 活動中\nDiscord Token={'✅' if DISCORD_TOKEN else '❌'}\nTwitter={'✅' if twitter_client else '❌'}\nOpenAI={'✅' if OPENAI_API_KEY else '❌'}")
 
-🐦 X API {'✅' if twitter_client else '❌'}
-"""
-    await ctx.send(status)
+# ====== Scheduler Loop ======
+@tasks.loop(minutes=1)
+async def scheduler_loop():
+    now = datetime.now(timezone(timedelta(hours=8)))
+    cursor.execute("SELECT hour FROM times")
+    hours = [t[0] for t in cursor.fetchall()]
+    if now.strftime("%H:%M") in hours:
+        cursor.execute("SELECT theme FROM themes")
+        themes = [t[0] for t in cursor.fetchall()]
+        if not themes:
+            logging.warning("沒有主題，跳過發文")
+            return
+        theme = themes[now.minute % len(themes)]  # 隨機選一個
+        prompt = f"{theme}"
+        image_url = await generate_image(prompt)
+        tweet_text = f"{theme} #{now.strftime('%Y-%m-%d %H:%M')}"
+        success = await post_tweet(tweet_text, image_url)
+        cursor.execute("INSERT INTO reports (timestamp, tweet) VALUES (?,?)", (now.isoformat(), tweet_text))
+        conn.commit()
+        logging.info(f"✅ 已發文: {tweet_text}, 成功: {success}")
 
-@bot.command()
-async def pause(ctx):
-    """暫停排程"""
-    global paused
-    paused = True
-    await ctx.send("⏸️ 已暫停排程")
+# ====== Heartbeat Loop ======
+@tasks.loop(minutes=1)
+async def heartbeat():
+    logging.info(f"🫀 Bot 活動中... {datetime.now(timezone(timedelta(hours=8)))}")
 
-@bot.command()
-async def resume(ctx):
-    """恢復排程"""
-    global paused
-    paused = False
-    await ctx.send("▶️ 已恢復排程")
-
-# ---------- 啟動 Bot ----------
+# ====== Bot Startup ======
 async def main():
-    try:
-        scheduled_post.start()
-    except Exception as e:
-        logging.error(f"Scheduler 啟動失敗: {e}")
-
-    while True:
-        try:
-            await bot.start(DISCORD_TOKEN)
-        except Exception as e:
-            logging.error(f"Bot 發生錯誤: {e}")
-            await asyncio.sleep(10)  # 失敗後等待再重試
+    heartbeat.start()
+    scheduler_loop.start()
+    await bot.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
     try:
