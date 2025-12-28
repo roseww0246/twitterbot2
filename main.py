@@ -1,62 +1,66 @@
 import os
 import discord
 from discord.ext import commands
-import openai
+from fastapi import FastAPI
+import uvicorn
 import asyncio
+import openai
+import logging
 
-# 設定環境變數
+# ----------------- 設定 -----------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+PORT = int(os.getenv("PORT", 8080))
 
 if not DISCORD_TOKEN or not OPENAI_API_KEY:
-    raise ValueError("請確認已設定 DISCORD_TOKEN 和 OPENAI_API_KEY 環境變數")
+    raise ValueError("請確認環境變數 DISCORD_TOKEN 與 OPENAI_API_KEY 已設定")
 
 openai.api_key = OPENAI_API_KEY
 
-# Discord intents
 intents = discord.Intents.default()
-intents.message_content = True  # 讓 Bot 可以讀取訊息內容
+intents.message_content = True  # 確保可以讀取訊息內容
 
-bot = commands.Bot(command_prefix="/", intents=intents, help_command=None)
+bot = commands.Bot(command_prefix="/", intents=intents)
+app = FastAPI()
+logging.basicConfig(level=logging.INFO)
 
-@bot.event
-async def on_ready():
-    print(f"✅ 已登入 Discord: {bot.user}")
-    print("🫀 Bot 待命中...")
-
-# /make_picture 指令
-@bot.command(name="make_picture")
-async def make_picture(ctx, *, prompt: str):
-    """
-    使用 OpenAI 生成圖片並回傳至 Discord 頻道
-    """
-    await ctx.send(f"🎨 開始生成圖片: {prompt}")
+# ----------------- Discord 指令 -----------------
+@bot.slash_command(name="make_picture", description="生成圖片並回傳到頻道")
+async def make_picture(ctx: discord.ApplicationContext, prompt: str):
+    await ctx.respond("🖌️ 開始生成圖片，請稍候...")
     try:
-        response = openai.images.generate(
-            model="gpt-image-1",
+        response = openai.Image.create(
             prompt=prompt,
-            size="1024x1024"
+            n=1,
+            size="512x512"
         )
-        image_url = response.data[0].url
-        await ctx.send(f"🖼️ 生成完成: {image_url}")
+        image_url = response['data'][0]['url']
+        await ctx.send(f"✅ 圖片生成完成：{image_url}")
     except openai.error.OpenAIError as e:
-        # 處理額度用盡
-        if hasattr(e, "http_status") and e.http_status == 400 and "billing_hard_limit_reached" in str(e):
-            await ctx.send("⚠️ 生成失敗：帳號額度已用完，請檢查 OpenAI 帳號。")
-        else:
-            await ctx.send(f"❌ 生成圖片失敗: {e}")
+        await ctx.send(f"❌ 生成圖片時出錯：{e}")
 
-# 保活心跳（Railway friendly）
-async def keep_alive():
-    while True:
-        print("💓 Bot 保活心跳...")
-        await asyncio.sleep(300)  # 每 5 分鐘印一次訊息
+# ----------------- FastAPI 保活 -----------------
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
+
+# ----------------- 啟動函數 -----------------
+async def start_bot():
+    await bot.start(DISCORD_TOKEN)
 
 async def main():
-    async with bot:
-        bot.loop.create_task(keep_alive())
-        await bot.start(DISCORD_TOKEN)
+    # 建立 Discord Bot 任務
+    bot_task = asyncio.create_task(start_bot())
+    # 啟動 FastAPI
+    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
+    server = uvicorn.Server(config)
+    server_task = asyncio.create_task(server.serve())
 
-# 啟動 Bot
+    # 等待兩個任務結束（實際上會常駐）
+    await asyncio.gather(bot_task, server_task)
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Bot 停止運行")
