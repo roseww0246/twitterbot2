@@ -2,172 +2,189 @@ import os
 import asyncio
 import logging
 from datetime import datetime
+from discord.ext import commands, tasks
+import discord
+import tweepy
+import openai
 import pytz
 
-import discord
-from discord import app_commands
-from dotenv import load_dotenv
-
-import openai
-import tweepy
-
-# ────────── 基本設定 ──────────
-load_dotenv()
+# -------------------------
+# 初始化 Logging
+# -------------------------
 logging.basicConfig(level=logging.INFO)
 
-TZ = pytz.timezone("Asia/Taipei")
-
-# ────────── 環境變數 ──────────
+# -------------------------
+# 環境變數
+# -------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 X_API_KEY = os.getenv("X_API_KEY")
 X_API_SECRET = os.getenv("X_API_SECRET")
 X_ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN")
 X_ACCESS_TOKEN_SECRET = os.getenv("X_ACCESS_TOKEN_SECRET")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not all([DISCORD_TOKEN, X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET, OPENAI_API_KEY]):
+    logging.error("❌ 請確認所有環境變數都已設定")
+    exit(1)
 
 openai.api_key = OPENAI_API_KEY
 
-# ────────── Discord Bot ──────────
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
-
-# ────────── 全域狀態 ──────────
-X_STATUS = {
-    "login": False,
-    "can_tweet": False,
-    "can_media": False,
-    "error": None
-}
-
-TOPICS = [
-    "科技冷知識",
-    "AI 小技巧",
-    "程式語錄"
-]
-
-POST_TIMES = ["08:00", "12:00", "18:00", "22:00"]
-PAUSED = False
-
-
-# ────────── X API 初始化 ──────────
-def init_x_clients():
+# -------------------------
+# Tweepy X API 初始化
+# -------------------------
+try:
     auth = tweepy.OAuth1UserHandler(
-        X_API_KEY,
-        X_API_SECRET,
-        X_ACCESS_TOKEN,
-        X_ACCESS_TOKEN_SECRET
+        X_API_KEY, X_API_SECRET,
+        X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET
     )
+    twitter_api = tweepy.API(auth)
+    twitter_api.verify_credentials()
+    logging.info("✅ X API 登入成功")
+except Exception as e:
+    logging.error(f"❌ X API 登入失敗: {e}")
+    twitter_api = None
 
-    api_v1 = tweepy.API(auth)
-    client_v2 = tweepy.Client(
-        consumer_key=X_API_KEY,
-        consumer_secret=X_API_SECRET,
-        access_token=X_ACCESS_TOKEN,
-        access_token_secret=X_ACCESS_TOKEN_SECRET
-    )
-    return api_v1, client_v2
+# -------------------------
+# Discord Bot 初始化
+# -------------------------
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="/", intents=intents)
 
+# -------------------------
+# Scheduler 變數
+# -------------------------
+post_times = ["08:00", "12:00", "18:00", "22:00"]
+themes = ["可愛動物", "迷因", "熱門主題"]
 
-# ────────── X API 自我檢測 ──────────
-def x_api_self_check():
-    global X_STATUS
+paused = False
 
-    try:
-        api_v1, client_v2 = init_x_clients()
+# -------------------------
+# 工具函數
+# -------------------------
+def get_current_time():
+    tz = pytz.timezone("Asia/Taipei")
+    return datetime.now(tz).strftime("%H:%M")
 
-        # 1️⃣ 登入測試
-        me = client_v2.get_me()
-        X_STATUS["login"] = True
-
-        # 2️⃣ 發文字測試
-        client_v2.create_tweet(text="(API 測試) 文字權限確認")
-        X_STATUS["can_tweet"] = True
-
-        # 3️⃣ 圖片測試（Free tier 通常會失敗）
-        try:
-            api_v1.media_upload("test.png")
-            X_STATUS["can_media"] = True
-        except Exception:
-            X_STATUS["can_media"] = False
-
-    except Exception as e:
-        X_STATUS["error"] = str(e)
-
-    logging.info(f"X API 狀態：{X_STATUS}")
-
-
-# ────────── OpenAI 產文 ──────────
-def generate_text(topic: str) -> str:
-    resp = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "你是一個推特文案助手"},
-            {"role": "user", "content": f"請寫一則關於「{topic}」的短推文"}
-        ]
-    )
-    return resp.choices[0].message.content
-
-
-# ────────── 發文（Free tier 安全版） ──────────
-def post_to_x(text: str):
-    if not X_STATUS["can_tweet"]:
-        logging.error("❌ 無發文權限")
+async def post_to_twitter(theme):
+    if twitter_api is None:
+        logging.warning("❌ X API 未登入，跳過發文")
         return
 
-    api_v1, client_v2 = init_x_clients()
+    try:
+        # 生成圖片 (OpenAI API)
+        response = openai.Image.create(
+            prompt=f"{theme}, cute style, trending",
+            n=1,
+            size="512x512"
+        )
+        img_url = response['data'][0]['url']
 
-    if X_STATUS["can_media"]:
-        logging.info("（理論上）可發圖，但 Free tier 幾乎不會進來")
+        # Twitter 發文
+        twitter_api.update_status(status=f"今日主題: {theme}\n#BotTest\n{img_url}")
+        logging.info(f"✅ 已發文主題: {theme}")
+    except Exception as e:
+        logging.error(f"❌ 發文失敗: {e}")
+
+# -------------------------
+# Discord 指令
+# -------------------------
+@bot.command(description="增加發文時段")
+async def addtime(ctx, time: str):
+    if time not in post_times:
+        post_times.append(time)
+        await ctx.send(f"✅ 已增加時段: {time}")
     else:
-        logging.info("⚠️ Free tier：只發文字")
+        await ctx.send("⚠️ 時段已存在")
 
-    client_v2.create_tweet(text=text)
-    logging.info("✅ 推文已送出（文字）")
+@bot.command(description="刪除發文時段")
+async def removetime(ctx, time: str):
+    if time in post_times:
+        post_times.remove(time)
+        await ctx.send(f"✅ 已刪除時段: {time}")
+    else:
+        await ctx.send("⚠️ 時段不存在")
 
+@bot.command(description="查看現有發文時段")
+async def time_schedule(ctx):
+    await ctx.send(f"🕒 目前時段: {', '.join(post_times)}")
 
-# ────────── 排程迴圈 ──────────
-async def scheduler():
-    while True:
-        if not PAUSED:
-            now = datetime.now(TZ).strftime("%H:%M")
-            if now in POST_TIMES:
-                topic = TOPICS[datetime.now().hour % len(TOPICS)]
-                text = generate_text(topic)
-                post_to_x(text)
-                await asyncio.sleep(60)
-        await asyncio.sleep(10)
+@bot.command(description="增加主題")
+async def addtheme(ctx, *, theme: str):
+    if theme not in themes:
+        themes.append(theme)
+        await ctx.send(f"✅ 已增加主題: {theme}")
+    else:
+        await ctx.send("⚠️ 主題已存在")
 
+@bot.command(description="刪除主題")
+async def removetheme(ctx, *, theme: str):
+    if theme in themes:
+        themes.remove(theme)
+        await ctx.send(f"✅ 已刪除主題: {theme}")
+    else:
+        await ctx.send("⚠️ 主題不存在")
 
-# ────────── Discord 指令 ──────────
-@tree.command(name="debug", description="查看系統與 X API 狀態")
-async def debug(interaction: discord.Interaction):
+@bot.command(description="查看現有主題")
+async def theme_schedule(ctx):
+    await ctx.send(f"📚 目前主題: {', '.join(themes)}")
+
+@bot.command(description="暫停自動發文")
+async def stop(ctx):
+    global paused
+    paused = True
+    await ctx.send("⏸️ 已暫停自動發文")
+
+@bot.command(description="恢復自動發文")
+async def resume(ctx):
+    global paused
+    paused = False
+    await ctx.send("▶️ 已恢復自動發文")
+
+@bot.command(description="顯示系統偵錯")
+async def debug(ctx):
     msg = f"""
 🧪 系統偵錯
 ━━━━━━━━━━━━━━
 🕒 時區：Asia/Taipei
-⏰ 排程時間：{', '.join(POST_TIMES)}
-📚 主題數：{len(TOPICS)}
-⏸️ 暫停：{PAUSED}
+⏰ 排程時間：{', '.join(post_times)}
+📚 主題數：{len(themes)}
+⏸️ 暫停：{paused}
 
 🐦 X API
-登入：{'✅' if X_STATUS['login'] else '❌'}
-發文：{'✅' if X_STATUS['can_tweet'] else '❌'}
-圖片：{'✅' if X_STATUS['can_media'] else '❌（Free tier）'}
+登入：{"✅" if twitter_api else "❌"}
+發文：{"✅" if twitter_api else "❌"}
+圖片：✅ (OpenAI)
 
-⚠️ 錯誤：{X_STATUS['error']}
 """
-    await interaction.response.send_message(msg, ephemeral=True)
+    await ctx.send(msg)
 
+# -------------------------
+# 自動排程任務
+# -------------------------
+@tasks.loop(seconds=30)
+async def scheduler():
+    if paused or twitter_api is None:
+        return
+    now = get_current_time()
+    for t in post_times:
+        if now == t:
+            theme = themes[0]  # 簡單示範：選第一個主題
+            await post_to_twitter(theme)
 
-# ────────── 啟動 ──────────
-@client.event
-async def on_ready():
-    await tree.sync()
-    x_api_self_check()
-    asyncio.create_task(scheduler())
-    logging.info(f"🤖 Bot 已上線：{client.user}")
+@scheduler.before_loop
+async def before_scheduler():
+    await bot.wait_until_ready()
+    logging.info("⌛ Scheduler 已啟動")
 
+# -------------------------
+# 主程式
+# -------------------------
+scheduler.start()
 
-client.run(DISCORD_TOKEN)
+try:
+    bot.run(DISCORD_TOKEN)
+except discord.errors.HTTPException as e:
+    logging.error(f"❌ Discord 連線失敗: {e}")
+except KeyboardInterrupt:
+    logging.info("🛑 手動停止 Bot")
